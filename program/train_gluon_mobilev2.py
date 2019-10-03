@@ -7,6 +7,7 @@ from mxnet.gluon import nn
 import mxnet as mx
 from collections import namedtuple
 import os,time
+import random
 
 from mxnet import gluon, nd
 from mxnet import autograd as ag
@@ -19,6 +20,9 @@ from mxnet.gluon.model_zoo import vision
 from gluoncv.utils import viz
 from gluoncv.model_zoo import get_model
 from gluoncv.utils import export_block
+from gluoncv.model_zoo.densenet import get_densenet
+
+from augumentation.rotate_traffic_light import RotateTrafficLight
 
 import logging
 head = '%(asctime)-15s %(message)s'
@@ -33,9 +37,20 @@ class SoftMaxBlock(nn.HybridBlock):
 	def hybrid_forward(self, F, x):
 		return F.softmax(x)
 
+class RandomRotateTransform(nn.Block):
+	def forward(self,x):
+		ret = random.randint(0,1)
+		if ret == 0:
+			np_image = x.asnumpy()
+			Rot = RotateTrafficLight()
+			np_image,_ = Rot.RotateImage(np_image)
+			return mx.nd.array(np_image)
+		else:
+			return x
+
 class TlrTrainer:
 	def __init__(self):
-		self.num_epoch = 100
+		self.num_epoch = 300
 		self.ctx = [mx.gpu(0)]
 		#self.ctx = [mx.cpu()]
 
@@ -50,51 +65,57 @@ class TlrTrainer:
 		#net = vision.resnet18_v2(pretrained=True, ctx = self.ctx)
 
 		model_name = "mobilenetv2_1.0"
-		BATCH_SIZE = 64
+		BATCH_SIZE = 32
 		self.image_shape = 128
-		NUM_WORKERES  = 8
+		NUM_WORKERES  = 16  
 
 		print("Loading "+model_name)
 
-		self.finetune_net = get_model(model_name, pretrained = False)
+		mobilenet = True
 
 		transform_train = transforms.Compose([
-			transforms.Resize(self.image_shape),
-			#transforms.RandomFlipLeftRight(),
+			transforms.RandomFlipTopBottom(),
+			transforms.RandomBrightness(0.5),
 			transforms.RandomContrast(contrast = 0.5),
+			transforms.RandomSaturation(0.5),
+			transforms.RandomFlipTopBottom(),
+			RandomRotateTransform(),
+			transforms.Resize(self.image_shape),
 			transforms.ToTensor(),
 		])
 
 		transform_test = transforms.Compose([
 			transforms.Resize(self.image_shape),
 			transforms.ToTensor(),
-			
 		])
 
 		train_data = gluon.data.DataLoader(gluon.data.vision.ImageRecordDataset("./tlr_dataset_train.rec").transform_first(transform_train),batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERES)
 		val_data = gluon.data.DataLoader(gluon.data.vision.ImageRecordDataset("./tlr_dataset_val.rec").transform_first(transform_test), batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERES)
 		
-		self.finetune_net.hybridize(static_alloc=True,static_shape=True)
-		
-		with self.finetune_net.name_scope():
-			self.finetune_net.output = nn.HybridSequential(prefix='output_')
-			with self.finetune_net.output.name_scope():
-				self.finetune_net.output.add(nn.Conv2D(len(classes), 1, use_bias = False, prefix = 'pred_'), nn.Flatten(), SoftMaxBlock())
+		if mobilenet:
+			self.net = get_model(model_name, pretrained=False)
+			self.net.hybridize(static_alloc=True,static_shape=True)
+			with self.net.name_scope():
+				self.net.output = nn.HybridSequential(prefix='output_')
+				with self.net.output.name_scope():
+					self.net.output.add(nn.Conv2D(len(classes), 1, use_bias = False, prefix = 'pred_'), nn.Flatten(), SoftMaxBlock())
+		else:
+			self.net = get_densenet(51, pretrained=False, ctx=mx.gpu(0))
 		
 
-		self.finetune_net.initialize(init.Xavier(), ctx = self.ctx)
+		self.net.initialize(init.Xavier(), ctx = self.ctx)
 		'''
 		if _image_dir is not None:
-			self.finetune_net.load_parameters(
+			self.net.load_parameters(
 				_image_dir, self.ctx, allow_missing=True, ignore_extra=True)
 		'''
-		self.finetune_net.collect_params().reset_ctx(self.ctx)
+		self.net.collect_params().reset_ctx(self.ctx)
 		
 		lr = 0.01
 		lr_decay_epoch = [30, 60, 90, np.inf]
 
-		trainer = gluon.Trainer(self.finetune_net.collect_params(), 'sgd', {'learning_rate': lr, 'momentum':0.0005, 'wd':0.0001})
-
+		trainer = gluon.Trainer(self.net.collect_params(), 'sgd', {'learning_rate': lr, 'momentum':0.0005})
+		#trainer = gluon.Trainer(self.net.collect_params(), 'adam', {'learning_rate': 0.0002})
 		metric = mx.metric.Accuracy()
 		L = gluon.loss.SoftmaxCrossEntropyLoss(from_logits = True)
 
@@ -126,7 +147,7 @@ class TlrTrainer:
 					data  = gluon.utils.split_and_load(batch[0], ctx_list = self.ctx, batch_axis = 0, even_split = False)
 					label = gluon.utils.split_and_load(batch[1], ctx_list = self.ctx, batch_axis = 0, even_split = False)
 					with ag.record():
-						outputs = [mx.nd.log(self.finetune_net(X)) for X in data]
+						outputs = [mx.nd.log(self.net(X)) for X in data]
 						loss = [L(yhat, y) for yhat, y in zip(outputs, label)]
 					for l in loss:
 						l.backward()
@@ -139,28 +160,19 @@ class TlrTrainer:
 				_, train_acc = metric.get()
 				train_loss /= num_batch
 
-				_, val_acc = self.test(self.finetune_net, val_data, self.ctx)
+				_, val_acc = self.test(self.net, val_data, self.ctx)
 				print('[Epoch %d] Train-acc: %.3f, loss: %.3f | Val-acc: %.3f | time: %.1f' %(epoch, train_acc, train_loss, val_acc, time.time() - tic))
-				self.finetune_net.save_parameters(param_name)
+				self.net.save_parameters(param_name)
 		except KeyboardInterrupt:
-			self.finetune_net.save_parameters("backup/"+ssd_model_name+"_"+str(_epoch)+".params")
 			print("Keyboard interrupted")
-			self.finetune_net.collect_params().reset_ctx(mx.cpu())
-			#export_block("backup/mxnet-network", self.finetune_net,
-					 #data_shape=(self.image_shape, self.image_shape, 3), layout = "CHW")
-			export_block("backup/mxnet-network", self.finetune_net,
-                            data_shape=(self.image_shape, self.image_shape, 3), layout="CHW", preprocess = False)
+			self.WriteJson()
 			sys.exit
 
-		self.finetune_net.collect_params().reset_ctx(mx.cpu())
-		export_block("backup/mxnet-network", self.finetune_net,
-                    data_shape=(self.image_shape, self.image_shape, 3), layout="CHW", preprocess=False)
-		#self.finetune_net.collect_params().reset_ctx(mx.cpu())
-		#export_block(ssd_model_name+'_tlr', self.finetune_net, data_shape=(self.image_shape, self.image_shape, 3))
-		#symbol, arg_params, aux_params = mx.model.load_checkpoint(model_name+'_knmz', 0)
-		#symbol = mx.symbol.SoftmaxOutput(data=symbol, name='softmax')
-		#symbol.tojson()
-		#symbol.save(model_name+'_knmz-symbol.json')
+		self.WriteJson()
+		#self.net.collect_params().reset_ctx(mx.cpu())
+		#export_block("backup/mxnet-network", self.net,
+        #            data_shape=(self.image_shape, self.image_shape, 3), layout="CHW", preprocess=False)
+
 
 	def test(self, net, val_data, ctx):
 		metric = mx.metric.Accuracy()
@@ -173,9 +185,11 @@ class TlrTrainer:
 		return metric.get()
 
 	def WriteJson(self):
-		self.finetune_net.collect_params().reset_ctx(mx.cpu())
-		export_block("mxnet_network", self.finetune_net, data_shape=(
+		self.net.collect_params().reset_ctx(mx.cpu())
+		
+		export_block("backup/mxnet_network", self.net, data_shape=(
 			self.image_shape, self.image_shape, 3), layout="CHW", preprocess=False)
+		self.net.collect_params().reset_ctx(mx.gpu(0))
 		#symbol, arg_params, aux_params = mx.model.load_checkpoint("mxnet_network", 0)
 
 if  __name__=='__main__':
